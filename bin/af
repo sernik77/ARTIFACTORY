@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""af - the Artifact Factory CLI for ARTIFACTORY.
+
+Stdlib only. Run from anywhere inside the repo:
+
+    bin/af new <kind> "<title>" [--tags a,b] [--summary "..."]
+    bin/af import <file> [--kind knowledge] [--origin URL] [--tags a,b] [--summary "..."]
+    bin/af index                 regenerate CATALOG.md
+    bin/af check                 validate front matter, links and catalog freshness
+    bin/af list [--kind K] [--tag T] [--status S]
+    bin/af search <words...>
+"""
+
+import argparse
+import datetime as dt
+import json
+
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ARTIFACTS = ROOT / "artifacts"
+TEMPLATES = ROOT / "templates"
+CATALOG = ROOT / "CATALOG.md"
+
+KINDS = {
+    "research": "Research notes: a question, sources, findings, open threads.",
+    "knowledge": "Distilled knowledge: what is true, how it works, tips that hold up.",
+    "docs": "Documentation of a system, tool or process.",
+    "guide": "Step-by-step how-to for a concrete task.",
+    "decision": "A decision record: context, options, choice, consequences.",
+    "cheatsheet": "Dense quick reference: commands, tables, defaults.",
+    "prototype": "A runnable prototype (folder with README.md + code).",
+}
+STATUSES = ("draft", "stable", "stale", "archived")
+REQUIRED = ("title", "kind", "status", "summary", "tags", "created", "updated")
+LIST_FIELDS = ("tags", "sources")
+
+
+# ---------------------------------------------------------------- front matter
+
+def parse_front_matter(text):
+    """Parse the tiny YAML subset we write: `key: value` and `key: [a, b]`."""
+    if not text.startswith("---\n"):
+        return None, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return None, text
+    meta = {}
+    for line in text[4:end].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            meta[key] = [unquote(v) for v in split_list(value[1:-1])]
+        else:
+            meta[key] = unquote(value)
+    return meta, text[end + 5:]
+
+
+def split_list(s):
+    items, cur, quote = [], "", None
+    for ch in s:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            cur += ch
+        elif ch == ",":
+            items.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        items.append(cur.strip())
+    return items
+
+
+def unquote(v):
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+def quote(v):
+    v = str(v)
+    if v == "" or re.search(r"[:#\[\],\"']|^\s|\s$", v):
+        return '"' + v.replace('"', "'") + '"'
+    return v
+
+
+def render_front_matter(meta):
+    order = ["title", "kind", "status", "summary", "tags", "created", "updated", "origin", "sources"]
+    keys = order + [k for k in meta if k not in order]
+    lines = ["---"]
+    for k in keys:
+        if k not in meta:
+            continue
+        v = meta[k]
+        if isinstance(v, list):
+            lines.append(f"{k}: [" + ", ".join(quote(x) for x in v) + "]")
+        else:
+            lines.append(f"{k}: {quote(v)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- helpers
+
+def today():
+    return dt.date.today().isoformat()
+
+
+def slugify(title):
+    s = re.sub(r"['’]", "", title.lower())
+    s = s.translate(str.maketrans("ąćęłńóśźż", "acelnoszz"))
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:64].rstrip("-") or "untitled"
+
+
+def csv_list(s):
+    return [x.strip() for x in s.split(",") if x.strip()] if s else []
+
+
+def artifact_files():
+    """Every artifact: artifacts/<kind>/<slug>.md or artifacts/<kind>/<slug>/README.md."""
+    out = []
+    for p in sorted(ARTIFACTS.rglob("*.md")):
+        rel = p.relative_to(ARTIFACTS).parts
+        if len(rel) == 2 or (len(rel) == 3 and rel[2] == "README.md"):
+            out.append(p)
+    return out
+
+
+def load(path):
+    meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
+    return meta or {}, body
+
+
+def slug_of(path):
+    return path.parent.name if path.name == "README.md" else path.stem
+
+
+def die(msg):
+    print(f"af: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def target_path(kind, slug):
+    if kind == "prototype":
+        return ARTIFACTS / kind / slug / "README.md"
+    return ARTIFACTS / kind / f"{slug}.md"
+
+
+# ---------------------------------------------------------------- new
+
+def cmd_new(a):
+    if a.kind not in KINDS:
+        die(f"unknown kind '{a.kind}'. Kinds: {', '.join(KINDS)}")
+    slug = a.slug or slugify(a.title)
+    path = target_path(a.kind, slug)
+    if path.exists():
+        die(f"{path.relative_to(ROOT)} already exists")
+    tpl = (TEMPLATES / f"{a.kind}.md").read_text(encoding="utf-8")
+    _, body = parse_front_matter(tpl)
+    meta = {
+        "title": a.title,
+        "kind": a.kind,
+        "status": "draft",
+        "summary": a.summary or "TODO: one sentence on what this artifact answers.",
+        "tags": csv_list(a.tags),
+        "created": today(),
+        "updated": today(),
+    }
+    if a.origin:
+        meta["origin"] = a.origin
+    body = body.replace("{{title}}", a.title).replace("{{date}}", today())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_front_matter(meta) + body, encoding="utf-8")
+    if a.kind == "prototype":
+        index = path.parent / "index.html"
+        index.write_text(PROTOTYPE_HTML.replace("{{title}}", a.title), encoding="utf-8")
+    print(path.relative_to(ROOT))
+
+
+PROTOTYPE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececec; --bg: #161616; } }
+  body { margin: 0; padding: 24px 16px; font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 720px; margin: 0 auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>{{title}}</h1>
+</main>
+<script>
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------- import (Claude Docs XML -> Markdown)
+
+def read_docs_xml(path):
+    """Accept a raw Claude Docs XML export or a saved `read` tool result (JSON + trailing text)."""
+    raw = Path(path).read_text(encoding="utf-8")
+    s = raw.lstrip()
+    if s.startswith("{"):
+        data, _ = json.JSONDecoder().raw_decode(s)
+        data = data.get("data", data)
+        if data.get("complete") is False:
+            die("the doc read is incomplete (complete=false); fetch every page before importing")
+        return data["xml"]
+    return s
+
+
+class DocsToMarkdown:
+    INLINE_MARKS = {"bold": "b", "strong": "b", "italic": "i", "em": "i",
+                    "code": "c", "strike": "s", "strikethrough": "s"}
+
+    def __init__(self):
+        self.unknown = set()
+
+    def convert(self, xml):
+        root = ET.fromstring(xml)
+        out = self.blocks(list(root), "")
+        return re.sub(r"\n{3,}", "\n\n", out).strip() + "\n"
+
+    # --- blocks
+
+    def blocks(self, nodes, indent):
+        parts = []
+        for n in nodes:
+            md = self.block(n, indent)
+            if md is not None:
+                parts.append(md)
+        return "\n\n".join(parts)
+
+    def block(self, n, indent):
+        tag = n.tag
+        if tag == "paragraph":
+            text = self.inline(n)
+            level = n.get("heading")
+            if level:
+                return indent + "#" * int(level) + " " + text.strip()
+            return indent + text.strip() if text.strip() else None
+        if tag == "list":
+            return self.list_(n, indent)
+        if tag == "codeBlock":
+            return self.code_block(n, indent)
+        if tag == "table":
+            return self.table(n, indent)
+        if tag in ("blockquote", "quote", "callout"):
+            inner = self.blocks(list(n), "")
+            return "\n".join(indent + "> " + l if l else indent + ">" for l in inner.splitlines())
+        if tag in ("horizontalRule", "divider", "hr"):
+            return indent + "---"
+        self.unknown.add(tag)
+        return self.blocks(list(n), indent) or None
+
+    def list_(self, n, indent):
+        ordered = n.get("kind") in ("ordered", "number", "numbered")
+        lines = []
+        for i, item in enumerate(c for c in n if c.tag == "listItem"):
+            marker = f"{i + 1}. " if ordered else "- "
+            if item.get("checked") in ("true", "false"):
+                marker += "[x] " if item.get("checked") == "true" else "[ ] "
+            sub = indent + " " * len(marker if ordered else "- ")
+            children = list(item)
+            first = ""
+            if children and children[0].tag == "paragraph":
+                first = self.inline(children[0]).strip()
+                children = children[1:]
+            entry = indent + marker + first
+            rest = self.blocks(children, sub)
+            lines.append(entry + ("\n" + ("\n" if any(c.tag != "list" for c in children) else "") + rest if rest else ""))
+        return "\n".join(lines)
+
+    def code_block(self, n, indent):
+        code = "".join(n.itertext())
+        longest = max((len(m) for m in re.findall(r"`+", code)), default=0)
+        fence = "`" * max(3, longest + 1)
+        lang = n.get("language") or ""
+        body = "\n".join(indent + l if l else l for l in code.rstrip("\n").split("\n"))
+        return f"{indent}{fence}{lang}\n{body}\n{indent}{fence}"
+
+    def table(self, n, indent):
+        rows = [r for r in n if r.tag == "row"]
+        if not rows:
+            return None
+        grid = [[self.cell(c) for c in r if c.tag == "cell"] for r in rows]
+        width = max(len(r) for r in grid)
+        grid = [r + [""] * (width - len(r)) for r in grid]
+        lines = ["| " + " | ".join(grid[0]) + " |", "|" + "---|" * width]
+        lines += ["| " + " | ".join(r) + " |" for r in grid[1:]]
+        return "\n".join(indent + l for l in lines)
+
+    def cell(self, c):
+        parts = []
+        for b in c:
+            if b.tag == "paragraph":
+                parts.append(self.inline(b).strip())
+            elif b.tag == "list":
+                ordered = b.get("kind") in ("ordered", "number", "numbered")
+                for i, it in enumerate(x for x in b if x.tag == "listItem"):
+                    txt = " ".join(self.inline(p).strip() for p in it if p.tag == "paragraph")
+                    parts.append((f"{i + 1}. " if ordered else "• ") + txt)
+            elif b.tag == "codeBlock":
+                parts.append("`" + " ".join("".join(b.itertext()).split()) + "`")
+            else:
+                parts.append(" ".join("".join(b.itertext()).split()))
+        text = "<br>".join(p for p in parts if p)
+        return text.replace("|", "\\|").replace("\n", " ")
+
+    # --- inline: flatten to (text, marks, href) runs, then merge equal neighbours
+
+    def inline(self, n):
+        runs = []
+        self.collect(n, frozenset(), None, runs, top=True)
+        merged = []
+        for text, marks, href in runs:
+            if merged and merged[-1][1] == marks and merged[-1][2] == href:
+                merged[-1][0] += text
+            else:
+                merged.append([text, marks, href])
+        # Wrap consecutive runs that share bold and link once, so "**A1.** **`x`**" becomes "**A1. `x`**".
+        out, i = [], 0
+        while i < len(merged):
+            bold, href = "b" in merged[i][1], merged[i][2]
+            j = i
+            while j < len(merged) and ("b" in merged[j][1]) == bold and merged[j][2] == href:
+                j += 1
+            inner = "".join(self.render_run(t, m - {"b"}, None) for t, m, _ in merged[i:j])
+            core = inner.strip()
+            if core and (bold or href):
+                lead, trail = inner[: len(inner) - len(inner.lstrip())], inner[len(inner.rstrip()):]
+                if bold:
+                    core = f"**{core}**"
+                if href:
+                    core = f"[{core}]({href})"
+                inner = lead + core + trail
+            out.append(inner)
+            i = j
+        return "".join(out)
+
+    def collect(self, n, marks, href, runs, top=False):
+        tag = n.tag
+        if not top:
+            if tag in self.INLINE_MARKS:
+                marks = marks | {self.INLINE_MARKS[tag]}
+            elif tag == "link":
+                href = n.get("href")
+            elif tag == "date":
+                runs.append((n.get("value", ""), marks, href))
+                return
+            elif tag == "mention":
+                runs.append((n.get("name", ""), marks, href))
+                return
+            elif tag == "comment":
+                return
+            elif tag in ("break", "hardBreak", "br"):
+                runs.append(("  \n", frozenset(), None))
+                return
+            elif tag != "text":
+                self.unknown.add(tag)
+        if n.text:
+            runs.append((n.text, marks, href))
+        for child in n:
+            self.collect(child, marks, href, runs)
+            if child.tail:
+                runs.append((child.tail, marks, href))
+
+    @staticmethod
+    def escape(text):
+        text = text.replace("\\", "\\\\")
+        text = re.sub(r"([*_`\[\]<])", r"\\\1", text)
+        text = re.sub(r"^(\s*)([#>+-])(\s)", r"\1\\\2\3", text)
+        return re.sub(r"^(\s*)(\d+)\.(\s)", r"\1\2\\.\3", text)
+
+    def render_run(self, text, marks, href):
+        if not text:
+            return ""
+        lead = text[: len(text) - len(text.lstrip())]
+        trail = text[len(text.rstrip()):]
+        core = text.strip()
+        if not core:
+            return text
+        if "c" in marks:
+            ticks = max((len(m) for m in re.findall(r"`+", core)), default=0) + 1
+            pad = " " if core.startswith("`") or core.endswith("`") else ""
+            core = "`" * ticks + pad + core + pad + "`" * ticks
+        else:
+            core = self.escape(core)
+        if "s" in marks:
+            core = f"~~{core}~~"
+        if "i" in marks:
+            core = f"*{core}*"
+        if "b" in marks:
+            core = f"**{core}**"
+        if href:
+            core = f"[{core}]({href})"
+        return lead + core + trail
+
+
+def cmd_import(a):
+    if a.kind not in KINDS or a.kind == "prototype":
+        die(f"import needs a text kind: {', '.join(k for k in KINDS if k != 'prototype')}")
+    conv = DocsToMarkdown()
+    body = conv.convert(read_docs_xml(a.file))
+    m = re.match(r"# (.+)", body)
+    title = a.title or (re.sub(r"[*_`\\]", "", m.group(1)) if m else Path(a.file).stem)
+    slug = a.slug or slugify(title)
+    path = target_path(a.kind, slug)
+    if path.exists() and not a.force:
+        die(f"{path.relative_to(ROOT)} already exists (use --force to overwrite)")
+    meta = {
+        "title": title,
+        "kind": a.kind,
+        "status": a.status,
+        "summary": a.summary or "TODO: one sentence on what this artifact answers.",
+        "tags": csv_list(a.tags),
+        "created": a.created or today(),
+        "updated": today(),
+    }
+    if a.origin:
+        meta["origin"] = a.origin
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_front_matter(meta) + "\n" + body, encoding="utf-8")
+    if conv.unknown:
+        print(f"af: note: unhandled elements rendered as plain text: {', '.join(sorted(conv.unknown))}", file=sys.stderr)
+    print(path.relative_to(ROOT))
+
+
+# ---------------------------------------------------------------- catalog
+
+def catalog_text():
+    entries = []
+    for p in artifact_files():
+        meta, _ = load(p)
+        entries.append((p, meta))
+    lines = [
+        "# Catalog",
+        "",
+        "<!-- Generated by `bin/af index`. Do not edit by hand. -->",
+        "",
+        f"{len(entries)} artifact(s). Kinds and conventions: [README](README.md).",
+        "",
+    ]
+    for kind in KINDS:
+        group = [(p, m) for p, m in entries if m.get("kind") == kind]
+        if not group:
+            continue
+        group.sort(key=lambda e: (e[1].get("updated", ""), e[1].get("title", "")), reverse=True)
+        lines += [f"## {kind.capitalize()} ({len(group)})", "", "| Artifact | Summary | Tags | Status | Updated |", "|---|---|---|---|---|"]
+        for p, m in group:
+            rel = p.relative_to(ROOT).as_posix()
+            cells = [
+                f"[{m.get('title', slug_of(p))}]({rel})",
+                m.get("summary", ""),
+                " ".join(f"`{t}`" for t in m.get("tags", [])),
+                m.get("status", ""),
+                m.get("updated", ""),
+            ]
+            lines.append("| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |")
+        lines.append("")
+    tags = {}
+    for p, m in entries:
+        for t in m.get("tags", []):
+            tags.setdefault(t, []).append((p, m))
+    if tags:
+        lines += ["## Tags", ""]
+        for t in sorted(tags):
+            links = ", ".join(f"[{m.get('title', slug_of(p))}]({p.relative_to(ROOT).as_posix()})" for p, m in tags[t])
+            lines.append(f"- `{t}`: {links}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_index(a):
+    CATALOG.write_text(catalog_text(), encoding="utf-8")
+    print(CATALOG.relative_to(ROOT))
+
+
+# ---------------------------------------------------------------- check
+
+def cmd_check(a):
+    problems = []
+    seen = {}
+    for p in artifact_files():
+        rel = p.relative_to(ROOT).as_posix()
+        meta, body = load(p)
+        if not meta:
+            problems.append(f"{rel}: missing front matter")
+            continue
+        for k in REQUIRED:
+            if k not in meta or meta[k] in ("", None):
+                problems.append(f"{rel}: missing '{k}'")
+        for k in LIST_FIELDS:
+            if k in meta and not isinstance(meta[k], list):
+                problems.append(f"{rel}: '{k}' must be a [list]")
+        kind = meta.get("kind")
+        if kind not in KINDS:
+            problems.append(f"{rel}: unknown kind '{kind}'")
+        elif p.relative_to(ARTIFACTS).parts[0] != kind:
+            problems.append(f"{rel}: kind '{kind}' does not match its folder")
+        if kind == "prototype" and p.name != "README.md":
+            problems.append(f"{rel}: a prototype is a folder with README.md")
+        if meta.get("status") not in STATUSES:
+            problems.append(f"{rel}: status must be one of {', '.join(STATUSES)}")
+        for k in ("created", "updated"):
+            try:
+                dt.date.fromisoformat(meta.get(k, ""))
+            except ValueError:
+                problems.append(f"{rel}: '{k}' must be YYYY-MM-DD")
+        if meta.get("created", "") > meta.get("updated", "~"):
+            problems.append(f"{rel}: 'created' is after 'updated'")
+        if meta.get("status") == "stable" and "TODO" in meta.get("summary", ""):
+            problems.append(f"{rel}: stable artifact still has a TODO summary")
+        slug = slug_of(p)
+        if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug):
+            problems.append(f"{rel}: slug '{slug}' must be kebab-case")
+        if slug in seen:
+            problems.append(f"{rel}: slug '{slug}' also used by {seen[slug]}")
+        seen[slug] = rel
+        body_wo_code = re.sub(r"(?ms)^(`{3,}).*?^\1", "", body)
+        body_wo_code = re.sub(r"`[^`\n]*`", "", body_wo_code)
+        for target in re.findall(r"\]\(([^)\s]+)\)", body_wo_code):
+            if re.match(r"[a-z]+:|#", target):
+                continue
+            if not (p.parent / target.split("#")[0]).exists():
+                problems.append(f"{rel}: broken link -> {target}")
+    if not CATALOG.exists() or CATALOG.read_text(encoding="utf-8") != catalog_text():
+        problems.append("CATALOG.md is stale: run bin/af index")
+    for line in problems:
+        print(line)
+    n = len(artifact_files())
+    print(f"af check: {n} artifact(s), {len(problems)} problem(s)", file=sys.stderr)
+    sys.exit(1 if problems else 0)
+
+
+# ---------------------------------------------------------------- list / search
+
+def cmd_list(a):
+    for p in artifact_files():
+        m, _ = load(p)
+        if a.kind and m.get("kind") != a.kind:
+            continue
+        if a.tag and a.tag not in m.get("tags", []):
+            continue
+        if a.status and m.get("status") != a.status:
+            continue
+        print(f"{m.get('updated', '?'):10}  {m.get('status', '?'):8}  {m.get('kind', '?'):10}  "
+              f"{m.get('title', slug_of(p))}  ({p.relative_to(ROOT)})")
+
+
+def cmd_search(a):
+    words = [w.lower() for w in a.words]
+    hits = []
+    for p in artifact_files():
+        m, body = load(p)
+        head = " ".join([m.get("title", ""), m.get("summary", ""), " ".join(m.get("tags", []))]).lower()
+        low = body.lower()
+        if not all(w in head or w in low for w in words):
+            continue
+        score = sum(5 * head.count(w) + low.count(w) for w in words)
+        line = next((l.strip() for l in body.splitlines() if any(w in l.lower() for w in words)), "")
+        hits.append((score, p, m, line))
+    for score, p, m, line in sorted(hits, key=lambda h: -h[0]):
+        print(f"{m.get('title', slug_of(p))}  ({p.relative_to(ROOT)})  [{score}]")
+        if line:
+            print(f"    {line[:140]}")
+    if not hits:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="af", description="Artifact Factory for ARTIFACTORY.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("new", help="create an artifact from its kind's template")
+    p.add_argument("kind", help=" | ".join(KINDS))
+    p.add_argument("title")
+    p.add_argument("--slug")
+    p.add_argument("--tags", help="comma separated")
+    p.add_argument("--summary")
+    p.add_argument("--origin", help="URL this artifact came from")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("import", help="convert a Claude Docs XML read into a Markdown artifact")
+    p.add_argument("file", help="raw XML, or a saved Claude Docs `read` tool result")
+    p.add_argument("--kind", default="knowledge")
+    p.add_argument("--title")
+    p.add_argument("--slug")
+    p.add_argument("--tags", help="comma separated")
+    p.add_argument("--summary")
+    p.add_argument("--origin", help="claude.ai artifact URL")
+    p.add_argument("--status", default="draft", choices=STATUSES)
+    p.add_argument("--created", help="YYYY-MM-DD (default today)")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_import)
+
+    sub.add_parser("index", help="regenerate CATALOG.md").set_defaults(fn=cmd_index)
+    sub.add_parser("check", help="validate artifacts and catalog").set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("list", help="list artifacts")
+    p.add_argument("--kind")
+    p.add_argument("--tag")
+    p.add_argument("--status")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("search", help="full-text search over artifacts")
+    p.add_argument("words", nargs="+")
+    p.set_defaults(fn=cmd_search)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
