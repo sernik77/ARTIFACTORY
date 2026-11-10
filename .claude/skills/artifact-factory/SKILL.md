@@ -25,6 +25,7 @@ You turn questions and material into artifacts that live in `artifacts/<kind>/`.
 2. The result is usually too large and is saved to a tool-results file. Pass that file to the importer directly:
    `bin/af import <saved-file> --kind <kind> --origin <artifact URL> --tags a,b --summary "<one sentence>" --status stable`
    (`--created YYYY-MM-DD` keeps the original date.) The importer refuses a read marked `complete: false`.
+   If the read came back inline instead, write the XML to a temp file first and import that.
 3. Read the top of the output and one table and one code block to confirm the conversion, then `bin/af index && bin/af check`.
 4. Never write back to the source artifact or doc; importing is read-only.
 
